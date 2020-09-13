@@ -22,15 +22,17 @@ import (
 	"math/rand"
 	"reflect"
 	"strconv"
+	"syscall"
 	"testing"
 	"time"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/clock"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/watch"
 )
@@ -136,7 +138,7 @@ func TestReflectorWatchHandlerError(t *testing.T) {
 		fw.Stop()
 	}()
 	var resumeRV string
-	err := g.watchHandler(fw, &resumeRV, nevererrc, wait.NeverStop)
+	err := g.watchHandler(time.Now(), fw, &resumeRV, nevererrc, wait.NeverStop)
 	if err == nil {
 		t.Errorf("unexpected non-error")
 	}
@@ -156,7 +158,7 @@ func TestReflectorWatchHandler(t *testing.T) {
 		fw.Stop()
 	}()
 	var resumeRV string
-	err := g.watchHandler(fw, &resumeRV, nevererrc, wait.NeverStop)
+	err := g.watchHandler(time.Now(), fw, &resumeRV, nevererrc, wait.NeverStop)
 	if err != nil {
 		t.Errorf("unexpected error %v", err)
 	}
@@ -205,7 +207,7 @@ func TestReflectorStopWatch(t *testing.T) {
 	var resumeRV string
 	stopWatch := make(chan struct{}, 1)
 	stopWatch <- struct{}{}
-	err := g.watchHandler(fw, &resumeRV, nevererrc, stopWatch)
+	err := g.watchHandler(time.Now(), fw, &resumeRV, nevererrc, stopWatch)
 	if err != errorStopRequested {
 		t.Errorf("expected stop error, got %q", err)
 	}
@@ -355,6 +357,82 @@ func TestReflectorListAndWatchWithErrors(t *testing.T) {
 		}
 		r := NewReflector(lw, &v1.Pod{}, s, 0)
 		r.ListAndWatch(wait.NeverStop)
+	}
+}
+
+func TestReflectorListAndWatchInitConnBackoff(t *testing.T) {
+	maxBackoff := 50 * time.Millisecond
+	table := []struct {
+		numConnFails  int
+		expLowerBound time.Duration
+		expUpperBound time.Duration
+	}{
+		{5, 32 * time.Millisecond, 64 * time.Millisecond}, // case where maxBackoff is not hit, time should grow exponentially
+		{40, 35 * 2 * maxBackoff, 40 * 2 * maxBackoff},    // case where maxBoff is hit, backoff time should flatten
+
+	}
+	for _, test := range table {
+		t.Run(fmt.Sprintf("%d connection failures takes at least %d ms", test.numConnFails, 1<<test.numConnFails),
+			func(t *testing.T) {
+				stopCh := make(chan struct{})
+				connFails := test.numConnFails
+				fakeClock := clock.NewFakeClock(time.Unix(0, 0))
+				bm := wait.NewExponentialBackoffManager(time.Millisecond, maxBackoff, 100*time.Millisecond, 2.0, 1.0, fakeClock)
+				done := make(chan struct{})
+				defer close(done)
+				go func() {
+					i := 0
+					for {
+						select {
+						case <-done:
+							return
+						default:
+						}
+						if fakeClock.HasWaiters() {
+							step := (1 << (i + 1)) * time.Millisecond
+							if step > maxBackoff*2 {
+								step = maxBackoff * 2
+							}
+							fakeClock.Step(step)
+							i++
+						}
+						time.Sleep(100 * time.Microsecond)
+					}
+				}()
+				lw := &testLW{
+					WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+						if connFails > 0 {
+							connFails--
+							return nil, syscall.ECONNREFUSED
+						}
+						close(stopCh)
+						return watch.NewFake(), nil
+					},
+					ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+						return &v1.PodList{ListMeta: metav1.ListMeta{ResourceVersion: "1"}}, nil
+					},
+				}
+				r := &Reflector{
+					name:                   "test-reflector",
+					listerWatcher:          lw,
+					store:                  NewFIFO(MetaNamespaceKeyFunc),
+					initConnBackoffManager: bm,
+					clock:                  fakeClock,
+					watchErrorHandler:      WatchErrorHandler(DefaultWatchErrorHandler),
+				}
+				start := fakeClock.Now()
+				err := r.ListAndWatch(stopCh)
+				elapsed := fakeClock.Since(start)
+				if err != nil {
+					t.Errorf("unexpected error %v", err)
+				}
+				if elapsed < (test.expLowerBound) {
+					t.Errorf("expected lower bound of ListAndWatch: %v, got %v", test.expLowerBound, elapsed)
+				}
+				if elapsed > (test.expUpperBound) {
+					t.Errorf("expected upper bound of ListAndWatch: %v, got %v", test.expUpperBound, elapsed)
+				}
+			})
 	}
 }
 
@@ -711,6 +789,70 @@ func TestReflectorFullListIfExpired(t *testing.T) {
 	expectedRVs := []string{"0", "10", "", "10"}
 	if !reflect.DeepEqual(listCallRVs, expectedRVs) {
 		t.Errorf("Expected series of list calls with resource versiosn of %#v but got: %#v", expectedRVs, listCallRVs)
+	}
+}
+
+func TestReflectorFullListIfTooLarge(t *testing.T) {
+	stopCh := make(chan struct{})
+	s := NewStore(MetaNamespaceKeyFunc)
+	listCallRVs := []string{}
+
+	lw := &testLW{
+		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+			// Stop once the reflector begins watching since we're only interested in the list.
+			close(stopCh)
+			fw := watch.NewFake()
+			return fw, nil
+		},
+		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+			listCallRVs = append(listCallRVs, options.ResourceVersion)
+
+			switch options.ResourceVersion {
+			// initial list
+			case "0":
+				return &v1.PodList{ListMeta: metav1.ListMeta{ResourceVersion: "20"}}, nil
+			// relist after the initial list
+			case "20":
+				err := apierrors.NewTimeoutError("too large resource version", 1)
+				err.ErrStatus.Details.Causes = []metav1.StatusCause{{Type: metav1.CauseTypeResourceVersionTooLarge}}
+				return nil, err
+			// relist after the initial list (covers the error format used in api server 1.17.0-1.18.5)
+			case "30":
+				err := apierrors.NewTimeoutError("too large resource version", 1)
+				err.ErrStatus.Details.Causes = []metav1.StatusCause{{Message: "Too large resource version"}}
+				return nil, err
+			// relist from etcd after "too large" error
+			case "":
+				return &v1.PodList{ListMeta: metav1.ListMeta{ResourceVersion: "30"}}, nil
+			default:
+				return nil, fmt.Errorf("unexpected List call: %s", options.ResourceVersion)
+			}
+		},
+	}
+	r := NewReflector(lw, &v1.Pod{}, s, 0)
+
+	// Initial list should use RV=0
+	if err := r.ListAndWatch(stopCh); err != nil {
+		t.Fatal(err)
+	}
+
+	// Relist from the future version.
+	// This may happen, as watchcache is initialized from "current global etcd resource version"
+	// when kube-apiserver is starting and if no objects are changing after that each kube-apiserver
+	// may be synced to a different version and they will never converge.
+	// TODO: We should use etcd progress-notify feature to avoid this behavior but until this is
+	// done we simply try to relist from now to avoid continuous errors on relists.
+	for i := 1; i <= 2; i++ {
+		// relist twice to cover the two variants of TooLargeResourceVersion api errors
+		stopCh = make(chan struct{})
+		if err := r.ListAndWatch(stopCh); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	expectedRVs := []string{"0", "20", "", "30", ""}
+	if !reflect.DeepEqual(listCallRVs, expectedRVs) {
+		t.Errorf("Expected series of list calls with resource version of %#v but got: %#v", expectedRVs, listCallRVs)
 	}
 }
 
